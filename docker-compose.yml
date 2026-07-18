@@ -1,0 +1,249 @@
+version: '3.8'
+
+services:
+  # Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: lanework-postgres
+    environment:
+      POSTGRES_USER: lanework
+      POSTGRES_PASSWORD: lanework
+      POSTGRES_DB: lanework
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lanework"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - lanework-network
+
+  # Kafka for event streaming
+  kafka:
+    image: bitnami/kafka:3.5
+    container_name: lanework-kafka
+    environment:
+      KAFKA_CFG_NODE_ID: "0"
+      KAFKA_CFG_PROCESS_ROLES: "controller,broker"
+      KAFKA_CFG_LISTENERS: "PLAINTEXT://:9092,CONTROLLER://:9093"
+      KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP: "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT"
+      KAFKA_CFG_CONTROLLER_QUORUM_VOTERS: "0@kafka:9093"
+      KAFKA_CFG_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+      KAFKA_CFG_ADVERTISED_LISTENERS: "PLAINTEXT://kafka:9092"
+    ports:
+      - "9092:9092"
+    volumes:
+      - kafka_data:/bitnami/kafka
+    healthcheck:
+      test: ["CMD", "kafka-broker.sh", "status"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - lanework-network
+
+  # Redis for caching and rate limiting
+  redis:
+    image: redis:7-alpine
+    container_name: lanework-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - lanework-network
+
+  # API Gateway
+  api-gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile.api-gateway
+    container_name: lanework-api-gateway
+    environment:
+      API_GATEWAY_API_HOST: "0.0.0.0"
+      API_GATEWAY_API_PORT: "8080"
+      API_GATEWAY_API_DEBUG: "true"
+      API_GATEWAY_DATABASE_URL: "postgresql+asyncpg://lanework:lanework@postgres:5432/lanework"
+      API_GATEWAY_API_KEY: "test-api-key"
+      API_GATEWAY_TENANT_ID: "default"
+      API_GATEWAY_ORCHESTRATOR_URL: "http://orchestrator:8000"
+      API_GATEWAY_SHIPMENT_TRACKING_HOST: "shipment-tracking"
+      API_GATEWAY_SHIPMENT_TRACKING_PORT: "8001"
+      API_GATEWAY_INVENTORY_HOST: "inventory"
+      API_GATEWAY_INVENTORY_PORT: "8002"
+      API_GATEWAY_ROUTE_OPTIMIZATION_HOST: "route-optimization"
+      API_GATEWAY_ROUTE_OPTIMIZATION_PORT: "8003"
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      orchestrator:
+        condition: service_started
+    networks:
+      - lanework-network
+
+  # Orchestrator
+  orchestrator:
+    build:
+      context: .
+      dockerfile: Dockerfile.orchestrator
+    container_name: lanework-orchestrator
+    environment:
+      ORCHESTRATOR_API_HOST: "0.0.0.0"
+      ORCHESTRATOR_API_PORT: "8000"
+      ORCHESTRATOR_API_DEBUG: "true"
+      ORCHESTRATOR_DATABASE_URL: "postgresql+asyncpg://lanework:lanework@postgres:5432/lanework"
+      ORCHESTRATOR_API_KEY: "test-api-key"
+      ORCHESTRATOR_TENANT_ID: "default"
+      ORCHESTRATOR_TOOL_BUS_URL: "http://tool-bus:8000"
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - lanework-network
+
+  # Shipment Tracking Agent
+  shipment-tracking:
+    build:
+      context: .
+      dockerfile: Dockerfile.agent
+    container_name: lanework-shipment-tracking
+    environment:
+      SHIPMENT_TRACKING_API_HOST: "0.0.0.0"
+      SHIPMENT_TRACKING_API_PORT: "8001"
+      SHIPMENT_TRACKING_API_DEBUG: "true"
+      SHIPMENT_TRACKING_DATABASE_URL: "postgresql+asyncpg://lanework:lanework@postgres:5432/lanework"
+      SHIPMENT_TRACKING_API_KEY: "test-api-key"
+      SHIPMENT_TRACKING_TENANT_ID: "default"
+      SHIPMENT_TRACKING_TOOL_BUS_URL: "http://tool-bus:8000"
+    ports:
+      - "8001:8001"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - lanework-network
+
+  # Inventory Agent
+  inventory:
+    build:
+      context: .
+      dockerfile: Dockerfile.agent
+    container_name: lanework-inventory
+    environment:
+      INVENTORY_API_HOST: "0.0.0.0"
+      INVENTORY_API_PORT: "8002"
+      INVENTORY_API_DEBUG: "true"
+      INVENTORY_DATABASE_URL: "postgresql+asyncpg://lanework:lanework@postgres:5432/lanework"
+      INVENTORY_API_KEY: "test-api-key"
+      INVENTORY_TENANT_ID: "default"
+      INVENTORY_TOOL_BUS_URL: "http://tool-bus:8000"
+    ports:
+      - "8002:8002"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - lanework-network
+
+  # Route Optimization Agent
+  route-optimization:
+    build:
+      context: .
+      dockerfile: Dockerfile.agent
+    container_name: lanework-route-optimization
+    environment:
+      ROUTE_OPTIMIZATION_API_HOST: "0.0.0.0"
+      ROUTE_OPTIMIZATION_API_PORT: "8003"
+      ROUTE_OPTIMIZATION_API_DEBUG: "true"
+      ROUTE_OPTIMIZATION_DATABASE_URL: "postgresql+asyncpg://lanework:lanework@postgres:5432/lanework"
+      ROUTE_OPTIMIZATION_API_KEY: "test-api-key"
+      ROUTE_OPTIMIZATION_TENANT_ID: "default"
+      ROUTE_OPTIMIZATION_TOOL_BUS_URL: "http://tool-bus:8000"
+    ports:
+      - "8003:8003"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - lanework-network
+
+  # Voice Gateway
+  voice-gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile.voice-gateway
+    container_name: lanework-voice-gateway
+    environment:
+      VOICE_GATEWAY_API_HOST: "0.0.0.0"
+      VOICE_GATEWAY_API_PORT: "8009"
+      VOICE_GATEWAY_API_DEBUG: "true"
+      VOICE_GATEWAY_DATABASE_URL: "postgresql+asyncpg://lanework:lanework@postgres:5432/lanework"
+      VOICE_GATEWAY_API_KEY: "test-api-key"
+      VOICE_GATEWAY_TENANT_ID: "default"
+      VOICE_GATEWAY_ORCHESTRATOR_URL: "http://orchestrator:8000"
+      VOICE_GATEWAY_LIVEKIT_HOST: "livekit"
+      VOICE_GATEWAY_LIVEKIT_PORT: "7880"
+    ports:
+      - "8009:8009"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      orchestrator:
+        condition: service_started
+    networks:
+      - lanework-network
+
+  # LiveKit for voice
+  livekit:
+    image: livekit/livekit-server:latest
+    container_name: lanework-livekit
+    environment:
+      LIVEKIT_KEY: "test-key"
+      LIVEKIT_SECRET: "test-secret"
+    ports:
+      - "7880:7880"
+      - "7881:7881"
+      - "7882:7882"
+    networks:
+      - lanework-network
+
+  # Dashboard (React frontend)
+  dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile.dashboard
+    container_name: lanework-dashboard
+    environment:
+      DASHBOARD_API_HOST: "0.0.0.0"
+      DASHBOARD_API_PORT: "3000"
+      DASHBOARD_API_DEBUG: "true"
+      DASHBOARD_API_GATEWAY_URL: "http://api-gateway:8080"
+      DASHBOARD_ORCHESTRATOR_URL: "http://orchestrator:8000"
+    ports:
+      - "3000:3000"
+    depends_on:
+      api-gateway:
+        condition: service_started
+    networks:
+      - lanework-network
+
+volumes:
+  postgres_data:
+  kafka_data:
+  redis_data:
+
+networks:
+  lanework-network:
+    driver: bridge
