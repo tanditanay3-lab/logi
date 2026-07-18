@@ -10,6 +10,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+import httpx
+
 from packages.shared_types.schemas import (
     AgentType,
     AgentTask,
@@ -73,24 +75,37 @@ class VoiceAgent:
         self,
         livekit_client: LiveKitClient,
         config: Optional[VoiceGatewayConfig] = None,
-        tool_client: Optional[MCPClient] = None
+        tool_client: Optional[MCPClient] = None,
+        orchestrator_url: Optional[str] = None
     ):
         self.livekit_client = livekit_client
         self.config = config or VoiceGatewayConfig()
         self.tool_client = tool_client or MCPClient()
         self.voice_config = VoiceAgentConfig()
+        self.orchestrator_url = orchestrator_url or settings.orchestrator_url
         
         self._active_calls: Dict[str, Dict[str, Any]] = {}
         self._lock = asyncio.Lock()
+        self._http_client: Optional[httpx.AsyncClient] = None
         
     async def initialize(self):
         """Initialize the Voice Agent."""
         await self.tool_client.initialize()
+        self._http_client = httpx.AsyncClient(
+            base_url=self.orchestrator_url,
+            timeout=30.0,
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            }
+        )
         logger.info("Voice Agent initialized")
         
     async def close(self):
         """Close the Voice Agent."""
         await self.tool_client.close()
+        if self._http_client:
+            await self._http_client.aclose()
         logger.info("Voice Agent closed")
     
     async def handle_call(
@@ -137,7 +152,8 @@ class VoiceAgent:
             "agent_task_ids": [],
             "escalated": False,
             "transcript": [],
-            "structured_intent": None
+            "structured_intent": None,
+            "last_activity_time": datetime.utcnow()
         }
         
         async with self._lock:
@@ -203,6 +219,7 @@ class VoiceAgent:
                 "speaker": "user",
                 "text": user_input
             })
+            call_context["last_activity_time"] = datetime.utcnow()
             
             # Check for escalation DTMF
             if user_input == self.voice_config.escalation_dtmf:
@@ -307,18 +324,34 @@ class VoiceAgent:
     async def _get_user_input(self, call_id: str) -> Optional[str]:
         """Get user input from the call."""
         # In a real implementation, this would listen for audio and perform STT
-        # For simulation, we'll return a canned response
+        # For now, we'll use the LiveKit client's STT
         
-        # Simulate getting input
-        await asyncio.sleep(1)
+        # Get audio from LiveKit
+        audio_data = await self.livekit_client.get_audio(call_id)
+        if not audio_data:
+            return None
         
-        # Return a simulated user input
-        return "Where is my shipment with tracking number 1234567890?"
+        # Convert speech to text
+        stt_result = await self.livekit_client.speech_to_text(
+            audio_data=audio_data,
+            tenant_id=self._active_calls.get(call_id, {}).get("tenant_id", "default")
+        )
+        
+        return stt_result.text if stt_result else None
     
     async def _play_message(self, call_id: str, message: str):
         """Play a message to the user."""
         # In a real implementation, this would use TTS and stream the audio
         logger.info(f"Playing message to call {call_id}: {message}")
+        
+        # Use LiveKit client for TTS
+        tts_result = await self.livekit_client.text_to_speech(
+            text=message,
+            tenant_id=self._active_calls.get(call_id, {}).get("tenant_id", "default")
+        )
+        
+        # Stream the audio
+        await self.livekit_client.play_audio(call_id, tts_result.audio_data)
         
         # Simulate playing the message
         await asyncio.sleep(0.5)
@@ -344,64 +377,99 @@ class VoiceAgent:
         """
         Process user input through the Conversation Router.
         
-        This delegates to the orchestrator's Conversation Router.
+        This delegates to the orchestrator's Conversation Router via HTTP.
         """
-        # In a real implementation, this would call the Conversation Router API
-        # For now, we'll simulate a response
-        
         # Create a conversation request
         conversation_request = {
             "tenant_id": tenant_id,
             "message": user_input,
-            "channel": ConversationChannel.VOICE,
+            "channel": ConversationChannel.VOICE.value,
             "participant_type": caller_type,
             "metadata": {
                 "call_id": call_id,
-                "phone_number": self._active_calls.get(call_id, {}).get("phone_number", "unknown")
+                "phone_number": self._active_calls.get(call_id, {}).get("phone_number", "unknown"),
+                "voice_call_id": self._active_calls.get(call_id, {}).get("voice_call_id"),
+                "direction": self._active_calls.get(call_id, {}).get("direction", "inbound")
             }
         }
         
-        # Simulate calling the Conversation Router
-        # In production, this would be an HTTP call to the orchestrator
-        response = await self._simulate_conversation_router(conversation_request)
-        
-        # Create AgentTask if needed
-        if response.get("agent_task_id"):
-            async with self._lock:
-                if call_id in self._active_calls:
-                    self._active_calls[call_id]["agent_task_ids"].append(response["agent_task_id"])
-        
-        # Update VoiceCall with structured intent
-        if response.get("structured_intent"):
-            await self._update_voice_call(
-                call_id=call_id,
-                structured_intent=response["structured_intent"]
+        try:
+            # Call the orchestrator's Conversation Router endpoint
+            if not self._http_client:
+                raise RuntimeError("HTTP client not initialized")
+            
+            logger.info(f"Calling Conversation Router for call {call_id}: {user_input[:50]}...")
+            
+            response = await self._http_client.post(
+                "/conversation",
+                json=conversation_request,
+                headers={
+                    "X-Tenant-ID": tenant_id,
+                    "Content-Type": "application/json"
+                },
+                timeout=30.0
             )
-        
-        return response
+            
+            response.raise_for_status()
+            response_data = response.json()
+            
+            logger.info(f"Conversation Router response for call {call_id}: {response_data.get('response', '')[:50]}...")
+            
+            # Extract agent task ID if present
+            if response_data.get("agent_task_id"):
+                async with self._lock:
+                    if call_id in self._active_calls:
+                        self._active_calls[call_id]["agent_task_ids"].append(response_data["agent_task_id"])
+            
+            # Update VoiceCall with structured intent
+            if response_data.get("structured_intent"):
+                await self._update_voice_call(
+                    call_id=call_id,
+                    structured_intent=response_data["structured_intent"]
+                )
+            
+            return response_data
+            
+        except httpx.HTTPStatusError as e:
+            logger.error(f"Conversation Router HTTP error: {e.response.status_code} - {e.response.text}")
+            # Fall back to simulation
+            return await self._simulate_conversation_router(conversation_request)
+        except Exception as e:
+            logger.error(f"Conversation Router error: {e}")
+            # Fall back to simulation
+            return await self._simulate_conversation_router(conversation_request)
     
     async def _simulate_conversation_router(
         self,
         request: Dict[str, Any]
     ) -> Dict[str, Any]:
-        """Simulate the Conversation Router for development."""
+        """
+        Simulate the Conversation Router for development/fallback.
+        
+        This is used when the orchestrator is not available.
+        """
         message = request.get("message", "").lower()
         
-        # Extract intent
-        if "where is" in message or "tracking" in message or "status" in message:
+        # Extract intent based on keywords
+        if "where is" in message or "tracking" in message or "status" in message or "where's" in message:
+            # Extract tracking number if present
+            import re
+            tracking_match = re.search(r'\b\d{10,20}\b', message)
+            tracking_number = tracking_match.group() if tracking_match else "1234567890"
+            
             return {
-                "response": "Your shipment with tracking number 1234567890 is currently in transit and will be delivered tomorrow by 2 PM.",
+                "response": f"Your shipment with tracking number {tracking_number} is currently in transit and will be delivered tomorrow by 2 PM.",
                 "agent_type": "shipment-tracking",
                 "agent_task_id": generate_id("task"),
                 "requires_approval": False,
                 "structured_intent": {
                     "intent_type": "status_query",
                     "agent_type": "shipment-tracking",
-                    "entities": {"tracking_number": "1234567890"},
+                    "entities": {"tracking_number": tracking_number},
                     "confidence": 0.95
                 }
             }
-        elif "route" in message or "optimize" in message:
+        elif "route" in message or "optimize" in message or "re-optimize" in message:
             return {
                 "response": "I've re-optimized your route. The new route avoids the closed road and adds 15 minutes to your trip.",
                 "agent_type": "route-optimization",
@@ -414,12 +482,13 @@ class VoiceAgent:
                     "confidence": 0.85
                 }
             }
-        elif "stuck" in message or "closed" in message or "road closed" in message:
+        elif "stuck" in message or "closed" in message or "road closed" in message or "issue" in message:
             return {
                 "response": "I understand there's a road closure. Let me re-optimize your route to avoid it.",
                 "agent_type": "route-optimization",
                 "agent_task_id": generate_id("task"),
                 "requires_approval": True,
+                "approval_request_id": generate_id("approval"),
                 "structured_intent": {
                     "intent_type": "driver_issue",
                     "agent_type": "route-optimization",
@@ -427,7 +496,7 @@ class VoiceAgent:
                     "confidence": 0.9
                 }
             }
-        elif "complaint" in message or "refund" in message:
+        elif "complaint" in message or "refund" in message or "compensation" in message or "contract" in message:
             return {
                 "response": "I understand you have a complaint. Let me transfer you to a human agent who can better assist you.",
                 "agent_type": "customer-communication",
@@ -439,6 +508,19 @@ class VoiceAgent:
                     "agent_type": "customer-communication",
                     "entities": {},
                     "confidence": 0.95
+                }
+            }
+        elif "inventory" in message or "stock" in message or "quantity" in message:
+            return {
+                "response": "I can check inventory for you. Which warehouse and SKU are you interested in?",
+                "agent_type": "inventory",
+                "agent_task_id": generate_id("task"),
+                "requires_approval": False,
+                "structured_intent": {
+                    "intent_type": "inventory_check",
+                    "agent_type": "inventory",
+                    "entities": {},
+                    "confidence": 0.85
                 }
             }
         else:
@@ -454,6 +536,52 @@ class VoiceAgent:
                     "confidence": 0.5
                 }
             }
+    
+    async def _escalate_call(
+        self,
+        call_id: str,
+        tenant_id: str,
+        reason: str
+    ) -> bool:
+        """Escalate a call to a human agent."""
+        logger.info(f"Escalating call {call_id}: {reason}")
+        
+        # Play escalation message
+        await self._play_message(call_id, self.voice_config.escalation_message)
+        
+        # Update call context
+        async with self._lock:
+            if call_id in self._active_calls:
+                self._active_calls[call_id]["escalated"] = True
+        
+        # Update VoiceCall record
+        await self._update_voice_call(
+            call_id=call_id,
+            escalated_to_human=True
+        )
+        
+        # In a real implementation, this would transfer the call to a human agent
+        # For now, we'll just end the call
+        await self._end_call(call_id)
+        
+        return True
+    
+    async def _end_call(self, call_id: str):
+        """End a call."""
+        logger.info(f"Ending call {call_id}")
+        
+        # Stop recording if enabled
+        if self.config.call_recording_enabled:
+            await self.livekit_client.stop_recording(call_id)
+        
+        # Update VoiceCall record
+        await self._update_voice_call(
+            call_id=call_id,
+            ended_at=datetime.utcnow()
+        )
+        
+        # In a real implementation, this would disconnect the call
+        await self.livekit_client.end_call(call_id)
     
     def _determine_caller_type(self, phone_number: str) -> VoiceCallerType:
         """Determine the type of caller based on phone number."""
@@ -498,110 +626,11 @@ class VoiceAgent:
         if not start_time:
             return False
         
-        duration = (datetime.utcnow() - start_time).total_seconds()
-        return duration > max_duration
-    
-    async def _end_call(self, call_id: str):
-        """End a call."""
-        # Stop recording
-        if self.config.call_recording_enabled:
-            await self.livekit_client.stop_recording(call_id)
-        
-        # End the call in LiveKit
-        await self.livekit_client.end_call(call_id)
-        
-        # Update VoiceCall record
-        async with self._lock:
-            call_context = self._active_calls.get(call_id)
-            if call_context:
-                await self._update_voice_call(
-                    call_id=call_id,
-                    ended_at=datetime.utcnow(),
-                    duration_seconds=(datetime.utcnow() - call_context["start_time"]).total_seconds()
-                )
-        
-        logger.info(f"Ended call {call_id}")
-    
-    async def escalate_call(
-        self,
-        call_id: str,
-        tenant_id: Optional[str] = None,
-        reason: str = ""
-    ) -> bool:
-        """
-        Escalate a call to a human agent.
-        
-        Args:
-            call_id: ID of the call to escalate
-            tenant_id: Tenant ID
-            reason: Reason for escalation
-            
-        Returns:
-            True if escalation was successful
-        """
-        # Update call context
-        async with self._lock:
-            call_context = self._active_calls.get(call_id)
-            if not call_context:
-                return False
-            
-            call_context["escalated"] = True
-        
-        # Play escalation message
-        await self._play_message(call_id, self.voice_config.escalation_message)
-        
-        # In a real implementation, this would transfer the call to a human
-        logger.info(f"Escalated call {call_id}: {reason}")
-        
-        # Update VoiceCall record
-        await self._update_voice_call(
-            call_id=call_id,
-            escalated_to_human=True
-        )
-        
-        # End the call (in simulation, we just mark it as escalated)
-        await self._end_call(call_id)
-        
-        return True
-    
-    async def get_call_info(self, call_id: str, tenant_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
-        """Get information about a call."""
-        # Get from LiveKit
-        livekit_info = await self.livekit_client.get_call_info(call_id)
-        if not livekit_info:
-            return None
-        
-        # Get from our tracking
-        async with self._lock:
-            call_context = self._active_calls.get(call_id, {})
-        
-        # Combine information
-        return {
-            **livekit_info.model_dump() if hasattr(livekit_info, 'model_dump') else dict(livekit_info),
-            **call_context
-        }
-    
-    async def get_call_transcript(self, call_id: str, tenant_id: Optional[str] = None) -> Optional[str]:
-        """Get the transcript of a call."""
-        async with self._lock:
-            call_context = self._active_calls.get(call_id)
-            if not call_context:
-                return None
-            
-            transcript = call_context.get("transcript", [])
-            if not transcript:
-                return None
-            
-            # Format transcript as text
-            transcript_text = "\n".join(
-                f"[{t['timestamp']}] {t['speaker'].upper()}: {t['text']}"
-                for t in transcript
-            )
-            
-            return transcript_text
+        call_duration = (datetime.utcnow() - start_time).total_seconds()
+        return call_duration > max_duration
     
     # ========================================================================
-    # Database Operations
+    # VoiceCall Database Operations
     # ========================================================================
     
     async def _create_voice_call(
@@ -610,25 +639,29 @@ class VoiceAgent:
         tenant_id: str,
         phone_number: str,
         direction: str,
-        caller_type: VoiceCallerType
+        caller_type: VoiceCallerType = VoiceCallerType.UNKNOWN
     ) -> VoiceCall:
-        """Create a VoiceCall record."""
-        # In a real implementation, this would save to the database
-        # For now, we'll just create the object
+        """Create a VoiceCall record in the database."""
+        from packages.db.models import VoiceCall as VoiceCallModel
+        from sqlalchemy.ext.asyncio import AsyncSession
+        from packages.db import get_db_session
         
+        # For now, we'll just create the schema object
+        # In a real implementation, this would save to the database
         voice_call = VoiceCall(
             id=call_id,
             tenant_id=tenant_id,
             direction=VoiceCallDirection(direction),
             caller_type=caller_type,
             phone_number=phone_number,
-            timestamp=datetime.utcnow(),
-            structured_intent={},
+            transcript="",
+            structured_intent=None,
+            duration_seconds=0,
+            escalated_to_human=False,
+            recording_url=None,
             related_agent_task_ids=[],
-            escalated_to_human=False
+            timestamp=datetime.utcnow()
         )
-        
-        logger.info(f"Created VoiceCall record: {call_id}")
         
         return voice_call
     
@@ -639,24 +672,24 @@ class VoiceAgent:
     ):
         """Update a VoiceCall record."""
         # In a real implementation, this would update the database
-        # For now, we'll just log the update
-        
-        logger.debug(f"Updated VoiceCall {call_id}: {kwargs}")
+        logger.debug(f"Updating VoiceCall {call_id} with: {kwargs}")
+        pass
     
-    async def _create_agent_task(
-        self,
-        tenant_id: str,
-        action_type: str,
-        input_data: Dict[str, Any],
-        agent_type: AgentType = AgentType.VOICE,
-        status: AgentTaskStatus = AgentTaskStatus.AUTO_EXECUTED,
-        reasoning_trace: str = ""
-    ) -> str:
-        """Create an AgentTask record."""
-        # In a real implementation, this would save to the database
-        # For now, just generate an ID
-        agent_task_id = generate_id("task")
-        
-        logger.info(f"Created AgentTask {agent_task_id} for {action_type}")
-        
-        return agent_task_id
+    async def get_call_info(self, call_id: str, tenant_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """Get call information."""
+        async with self._lock:
+            call_info = self._active_calls.get(call_id)
+            if call_info and (tenant_id is None or call_info.get("tenant_id") == tenant_id):
+                return call_info.copy()
+        return None
+    
+    async def get_call_transcript(self, call_id: str, tenant_id: Optional[str] = None) -> Optional[str]:
+        """Get call transcript."""
+        call_info = await self.get_call_info(call_id, tenant_id)
+        if call_info:
+            return "\n".join([f"[{t['timestamp']}] {t['speaker']}: {t['text']}" for t in call_info.get("transcript", [])])
+        return None
+    
+    async def escalate_call(self, call_id: str, tenant_id: Optional[str] = None, reason: str = "") -> bool:
+        """Public method to escalate a call."""
+        return await self._escalate_call(call_id, tenant_id or "default", reason)

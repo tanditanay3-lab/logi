@@ -244,7 +244,7 @@ class LiveKitClient:
         text: str,
         tenant_id: str,
         voice: Optional[str] = None
-    ) -> bytes:
+    ) -> TTSResult:
         """
         Convert text to speech audio.
         
@@ -254,7 +254,7 @@ class LiveKitClient:
             voice: Optional voice to use
             
         Returns:
-            Audio data in bytes (WAV format)
+            TTSResult with audio data
         """
         # In a real implementation, this would call the TTS engine
         # For now, we'll return a simple WAV file with silence
@@ -282,7 +282,12 @@ class LiveKitClient:
         
         logger.info(f"Generated {duration:.2f} seconds of TTS audio")
         
-        return audio_data
+        return TTSResult(
+            audio_data=audio_data,
+            format="wav",
+            duration_seconds=duration,
+            timestamp=datetime.utcnow()
+        )
     
     async def start_recording(self, call_id: str) -> bool:
         """
@@ -402,6 +407,76 @@ class LiveKitClient:
         
         # For simulation, we'll just log that we're receiving
         # In a real implementation, this would be an async stream
+    
+    async def get_audio(self, call_id: str) -> Optional[bytes]:
+        """
+        Get audio data from a call.
+        
+        Args:
+            call_id: ID of the call
+            
+        Returns:
+            Audio data in bytes, or None if no audio available
+        """
+        # In a real implementation, this would get audio from the LiveKit call
+        # For simulation, we'll return some dummy audio data
+        
+        # Simulate getting audio from the call
+        # This would be replaced with actual audio capture in production
+        import struct
+        sample_rate = 16000
+        duration = 2.0  # 2 seconds of audio
+        num_samples = int(sample_rate * duration)
+        
+        # WAV header
+        wav_header = b'RIFF' + struct.pack('<I', 36 + num_samples * 2)
+        wav_header += b'WAVEfmt ' + struct.pack('<I', 16)
+        wav_header += struct.pack('<H', 1)  # PCM format
+        wav_header += struct.pack('<H', 1)  # Mono
+        wav_header += struct.pack('<I', sample_rate)
+        wav_header += struct.pack('<I', sample_rate * 2)  # Byte rate
+        wav_header += struct.pack('<H', 2)  # Block align
+        wav_header += struct.pack('<H', 16)  # Bits per sample
+        wav_header += b'data' + struct.pack('<I', num_samples * 2)
+        
+        # Generate some dummy audio (sine wave for testing)
+        import math
+        audio_data = bytearray()
+        for i in range(num_samples):
+            # Generate a 440Hz sine wave
+            value = int(32767 * 0.5 * math.sin(2 * math.pi * 440 * i / sample_rate))
+            audio_data.extend(struct.pack('<h', value))
+        
+        return wav_header + bytes(audio_data)
+    
+    async def play_audio(self, call_id: str, audio_data: bytes) -> bool:
+        """
+        Play audio data to a call.
+        
+        Args:
+            call_id: ID of the call
+            audio_data: Audio data in bytes to play
+            
+        Returns:
+            True if audio was played successfully
+        """
+        # In a real implementation, this would stream audio to the LiveKit call
+        
+        # Get the participant for this call
+        async with self._lock:
+            call_info = self._active_calls.get(call_id)
+            if not call_info or not call_info.participant_id:
+                logger.warning(f"No participant for call {call_id}")
+                return False
+            participant_id = call_info.participant_id
+        
+        # Send the audio
+        success = await self.send_audio(participant_id, audio_data)
+        
+        if success:
+            logger.info(f"Played {len(audio_data)} bytes of audio to call {call_id}")
+        
+        return success
 
 
 # Default configuration function
