@@ -1,0 +1,38 @@
+# Dockerfile for Fleet & Driver Management Agent
+
+FROM python:3.11-slim
+
+# Set environment variables
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+# Set working directory
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy requirements
+COPY requirements.txt .
+
+# Install Python dependencies
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy application code
+COPY agents/fleet-management /app/agents/fleet-management
+COPY packages /app/packages
+
+# Set environment variables for the agent
+ENV AGENT_NAME=fleet-management \
+    AGENT_PORT=8005
+
+# Expose port
+EXPOSE 8005
+
+# Run the agent
+CMD ["python", "-m", "agents.fleet_management.main"]
