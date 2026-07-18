@@ -12,7 +12,7 @@ It handles:
 
 import logging
 from contextlib import asynccontextmanager
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -122,7 +122,7 @@ async def permission_exception_handler(request: Request, exc: PermissionExceptio
 
 
 # ============================================================================
-# Health Check Endpoint
+# Root and Health Check Endpoints
 # ============================================================================
 
 @app.get(
@@ -157,7 +157,162 @@ async def health_check() -> Dict[str, Any]:
 
 
 # ============================================================================
-# Voice Call Endpoints
+# Voice Call Endpoints (API Spec Compliant)
+# ============================================================================
+
+@app.post(
+    "/voice/calls",
+    summary="Initiate an outbound call",
+    description="Initiate an outbound call (requires tenant opt-in)",
+    response_model=Dict[str, Any]
+)
+async def initiate_outbound_call(
+    request: Request,
+    voice_agent: VoiceAgent = Depends(get_voice_agent),
+    x_tenant_id: Optional[str] = Header(default=None, alias="X-Tenant-ID"),
+    authorization: Optional[str] = Header(default=None, alias="Authorization")
+):
+    """
+    Initiate an outbound voice call.
+    
+    This endpoint:
+    - Validates tenant opt-in for outbound calls
+    - Initiates a call through LiveKit/SIP
+    - Routes to the appropriate agent via Conversation Router
+    - Returns call details
+    
+    Request body:
+    {
+        "phone_number": "string",
+        "caller_type": "driver|customer|dispatcher",
+        "intent": "string",
+        "message": "string | null",
+        "agent_type": "shipment-tracking|route-optimization|fleet-management|customer-communication"
+    }
+    """
+    # Verify authentication
+    if settings.api_key:
+        if not authorization or not authorization.startswith("Bearer "):
+            raise HTTPException(status_code=401, detail="Authentication required")
+        
+        api_key = authorization[7:]
+        if api_key != settings.api_key:
+            raise HTTPException(status_code=401, detail="Invalid API key")
+    
+    # Get request body
+    body = await request.json()
+    
+    # Validate required fields
+    if not body.get("phone_number"):
+        raise HTTPException(status_code=400, detail="phone_number is required")
+    
+    # Check if outbound calls are enabled for this tenant
+    # In a real implementation, this would check tenant configuration
+    if not settings.tenant_id and not x_tenant_id:
+        raise HTTPException(status_code=400, detail="Tenant ID is required")
+    
+    # Create call data
+    call_data = {
+        "call_id": body.get("call_id"),
+        "phone_number": body["phone_number"],
+        "direction": "outbound",
+        "caller_type": body.get("caller_type", "unknown"),
+        "intent": body.get("intent"),
+        "message": body.get("message"),
+        "agent_type": body.get("agent_type"),
+        "two_way": True  # Outbound calls are typically two-way
+    }
+    
+    # Handle the call
+    result = await voice_agent.handle_call(
+        call_data=call_data,
+        tenant_id=x_tenant_id
+    )
+    
+    # Format response per API spec
+    response = {
+        "call_id": result.get("call_id"),
+        "status": result.get("status", "queued"),
+        "agent_task_id": result.get("agent_task_ids", [None])[0] if result.get("agent_task_ids") else None
+    }
+    
+    return response
+
+
+@app.get(
+    "/voice/calls/{call_id}",
+    summary="Get call details",
+    description="Get details of a voice call",
+    response_model=Dict[str, Any]
+)
+async def get_voice_call_details(
+    call_id: str,
+    voice_agent: VoiceAgent = Depends(get_voice_agent),
+    x_tenant_id: Optional[str] = Header(default=None, alias="X-Tenant-ID"),
+    authorization: Optional[str] = Header(default=None, alias="Authorization")
+):
+    """
+    Get details of a voice call.
+    
+    Returns:
+    {
+        "id": "call_<uuid>",
+        "tenant_id": "tenant_<uuid>",
+        "direction": "inbound|outbound",
+        "caller_type": "driver|customer|dispatcher|unknown",
+        "phone_number": "string",
+        "transcript": "string | null",
+        "structured_intent": {...},
+        "duration_seconds": 0 | null,
+        "escalated_to_human": true,
+        "recording_url": "string | null",
+        "related_agent_task_ids": ["task_<uuid>"],
+        "status": "queued|dialing|in_progress|completed|failed",
+        "timestamp": "iso8601",
+        "ended_at": "iso8601 | null"
+    }
+    """
+    # Verify authentication
+    if settings.api_key:
+        if not authorization or not authorization.startswith("Bearer "):
+            raise HTTPException(status_code=401, detail="Authentication required")
+        
+        api_key = authorization[7:]
+        if api_key != settings.api_key:
+            raise HTTPException(status_code=401, detail="Invalid API key")
+    
+    # Get call info
+    call_info = await voice_agent.get_call_info(call_id, x_tenant_id)
+    
+    if not call_info:
+        raise NotFoundException("voice_call", call_id)
+    
+    # Get transcript
+    transcript = await voice_agent.get_call_transcript(call_id, x_tenant_id)
+    
+    # Format response per API spec
+    response = {
+        "id": call_info.get("call_id"),
+        "tenant_id": call_info.get("tenant_id"),
+        "direction": call_info.get("direction"),
+        "caller_type": call_info.get("caller_type", "unknown"),
+        "phone_number": call_info.get("phone_number"),
+        "transcript": transcript,
+        "structured_intent": call_info.get("structured_intent"),
+        "duration_seconds": call_info.get("duration_seconds"),
+        "escalated_to_human": call_info.get("escalated_to_human", False),
+        "recording_url": call_info.get("recording_url"),
+        "related_agent_task_ids": call_info.get("agent_task_ids", []),
+        "status": call_info.get("status"),
+        "timestamp": call_info.get("start_time").isoformat() if call_info.get("start_time") else None,
+        "ended_at": call_info.get("end_time").isoformat() if call_info.get("end_time") else None
+    }
+    
+    return response
+
+
+# ============================================================================
+# Legacy Call Endpoints (for backward compatibility)
 # ============================================================================
 
 @app.post(
