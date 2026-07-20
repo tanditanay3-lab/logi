@@ -1,0 +1,94 @@
+# Makefile for Lanework SaaS layer
+
+.PHONY: help dev dev-saas-api dev-saas-dashboard dev-admin-console docker-up docker-down docker-build docker-push
+
+# Colors
+GREEN := \033[0;32m
+YELLOW := \033[1;33m
+NC := \033[0m
+
+help: ## Show this help message
+	@echo "Lanework SaaS Build Commands:"
+	@echo ""
+	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "  $(GREEN)%-20s$(NC) %s\n", $$1, $$2}'
+	@echo ""
+
+# ============================================================================
+# Development
+# ============================================================================
+
+dev: dev-saas-api dev-saas-dashboard dev-admin-console
+
+dev-saas-api: ## Run saas-api in development mode
+	@echo "$(YELLOW)Starting saas-api...$(NC)"
+	cd apps/saas-api && uvicorn main:app --reload --host 0.0.0.0 --port 8000
+
+dev-saas-dashboard: ## Run saas-dashboard in development mode
+	@echo "$(YELLOW)Starting saas-dashboard...$(NC)"
+	cd apps/saas-dashboard && npm run dev
+
+dev-admin-console: ## Run admin-console in development mode
+	@echo "$(YELLOW)Starting admin-console...$(NC)"
+	cd apps/admin-console && npm run dev
+
+# ============================================================================
+# Docker
+# ============================================================================
+
+docker-up: ## Start all SaaS services with Docker
+	@echo "$(YELLOW)Starting SaaS services...$(NC)"
+	docker-compose -f docker-compose.saas.yml up -d
+
+docker-down: ## Stop all SaaS services
+	@echo "$(YELLOW)Stopping SaaS services...$(NC)"
+	docker-compose -f docker-compose.saas.yml down
+
+docker-build: ## Build SaaS Docker images
+	@echo "$(YELLOW)Building SaaS Docker images...$(NC)"
+	docker-compose -f docker-compose.saas.yml build
+
+docker-push: ## Push SaaS Docker images
+	@echo "$(YELLOW)Pushing SaaS Docker images...$(NC)"
+	docker-compose -f docker-compose.saas.yml push
+
+# ============================================================================
+# Database
+# ============================================================================
+
+db-init: ## Initialize SaaS database
+	@echo "$(YELLOW)Initializing SaaS database...$(NC)"
+	python -m saas_db.database init_db
+
+db-migrate: ## Run SaaS database migrations
+	@echo "$(YELLOW)Running SaaS database migrations...$(NC)"
+	cd packages/saas-db && alembic upgrade head
+
+db-make-migration: ## Create a new SaaS database migration
+	@echo "$(YELLOW)Creating new SaaS database migration...$(NC)"
+	cd packages/saas-db && alembic revision --autogenerate -m "$(message)"
+	@echo "Don't forget to update the message parameter"
+
+# ============================================================================
+# Testing
+# ============================================================================
+
+test: ## Run all SaaS tests
+	@echo "$(YELLOW)Running SaaS tests...$(NC)"
+	cd apps/saas-api && python -m pytest tests/
+
+test-saas-api: ## Run saas-api tests
+	@echo "$(YELLOW)Running saas-api tests...$(NC)"
+	cd apps/saas-api && python -m pytest tests/
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+clean: ## Clean up build artifacts
+	@echo "$(YELLOW)Cleaning up...$(NC)"
+	rm -rf apps/saas-api/__pycache__
+	rm -rf apps/saas-api/*.pyc
+	rm -rf apps/saas-dashboard/dist
+	rm -rf apps/saas-dashboard/node_modules
+	rm -rf apps/admin-console/dist
+	rm -rf apps/admin-console/node_modules

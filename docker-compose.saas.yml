@@ -1,0 +1,57 @@
+version: '3.8'
+
+services:
+  # SaaS API
+  saas-api:
+    build:
+      context: .
+      dockerfile: Dockerfile.saas-api
+    ports:
+      - "8000:8000"
+    environment:
+      - ENVIRONMENT=production
+      - SAAS_DATABASE_URL=postgresql+asyncpg://neondb_owner:npg_3YDpWTUa2ifV@ep-bitter-block-az9ls0rp.c-3.ap-southeast-1.aws.neon.tech/neondb?sslmode=require
+      - NEON_AUTH_URL=https://auth.neon.tech
+      - JWT_SECRET_KEY=change-me-in-production
+      - CORS_ORIGINS=http://localhost:3000,http://localhost:8000
+      - AGENT_PLATFORM_URL=http://api-gateway:8001
+    depends_on:
+      - api-gateway
+    networks:
+      - lanework-network
+    restart: unless-stopped
+
+  # SaaS Dashboard
+  saas-dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile.saas-dashboard
+    ports:
+      - "3000:3000"
+    environment:
+      - VITE_API_URL=http://localhost:8000
+    depends_on:
+      - saas-api
+    networks:
+      - lanework-network
+    restart: unless-stopped
+
+  # Admin Console
+  admin-console:
+    build:
+      context: .
+      dockerfile: Dockerfile.admin-console
+    ports:
+      - "3001:3000"
+    environment:
+      - VITE_API_URL=http://localhost:8000
+    depends_on:
+      - saas-api
+    networks:
+      - lanework-network
+    restart: unless-stopped
+
+networks:
+  lanework-network:
+    external: true
+    name: lanework-network

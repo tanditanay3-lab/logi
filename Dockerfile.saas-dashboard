@@ -1,0 +1,23 @@
+# Dockerfile for SaaS Dashboard
+
+FROM node:18-alpine
+
+# Set work directory
+WORKDIR /app
+
+# Install dependencies
+COPY apps/saas-dashboard/package.json .
+COPY apps/saas-dashboard/package-lock.json .
+RUN npm ci
+
+# Copy application code
+COPY apps/saas-dashboard .
+
+# Build the application
+RUN npm run build
+
+# Expose port
+EXPOSE 3000
+
+# Run the application
+CMD ["npm", "run", "preview"]
